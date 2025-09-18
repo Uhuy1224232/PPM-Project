@@ -7,16 +7,7 @@ import time
 import mediapipe as mp
 from flask import Flask, render_template, Response, jsonify
 from datetime import datetime
-import paho.mqtt.client as mqtt   # MQTT
-
-# --- MQTT Setup ---
-MQTT_BROKER = "192.168.196.155"   # ganti dengan IP Raspberry Pi (broker Mosquitto)
-MQTT_PORT = 1883
-MQTT_TOPIC = "led/display"
-
-mqtt_client = mqtt.Client()
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
 
@@ -48,10 +39,43 @@ mp_face = mp.solutions.face_detection.FaceDetection(
     min_detection_confidence=0.4
 )
 
+# ================= MQTT =================
+MQTT_BROKER = "192.168.1.100"  # IP server MQTT (bisa sama server Ubuntu)
+MQTT_PORT = 1883
+MQTT_TOPIC = "led/display"
+mqtt_client = mqtt.Client()
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.loop_start()
+
+# ================= Camera capture =================
+def capture_thread():
+    global frame, stop_thread
+    while not stop_thread:
+        cap = cv2.VideoCapture(
+            "rtsp://admin:BABKQU@192.168.196.93:554/h264/ch1/main/av_stream",
+            cv2.CAP_FFMPEG
+        )
+        if not cap.isOpened():
+            print("⚠️ Tidak bisa konek ke RTSP, coba lagi...")
+            time.sleep(3)
+            continue
+
+        while not stop_thread:
+            ret, f = cap.read()
+            if ret:
+                with lock:
+                    frame = f
+            else:
+                print("⚠️ Gagal ambil frame, reconnect...")
+                break
+            time.sleep(0.01)
+        cap.release()
+
+# ================= Face detection + MQTT trigger =================
 def detection_thread():
     global frame, output_frame, stop_thread, last_trigger_time, visitors_log
     frame_count = 0
-    
+
     while not stop_thread:
         with lock:
             if frame is None:
@@ -64,6 +88,7 @@ def detection_thread():
 
         small_frame = cv2.resize(f, None, fx=DOWNSCALE, fy=DOWNSCALE)
         rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
         results = mp_face.process(rgb_small)
 
         if results.detections:
@@ -103,12 +128,8 @@ def detection_thread():
                             "name": name,
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         })
+                        mqtt_client.publish(MQTT_TOPIC, f"Selamat Datang {name}")
                         last_trigger_time = now
-
-                        # --- Kirim ke LED Matrix lewat MQTT ---
-                        mqtt_message = f"Selamat Datang {name}"
-                        mqtt_client.publish(MQTT_TOPIC, mqtt_message)
-                        print(f"📡 MQTT Publish: {mqtt_message}")
 
         cv2.line(f, (0, LINE_Y), (f.shape[1], LINE_Y), (0, 0, 255), 2)
         cv2.putText(f, "Face Recognition System", (10, f.shape[0] - 40),
@@ -118,3 +139,77 @@ def detection_thread():
 
         with lock:
             output_frame = f
+
+# ================= Flask Routes =================
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/visitors')
+def get_visitors():
+    return jsonify(visitors_log[-10:])
+
+@app.route('/api/stats')
+def get_stats():
+    return jsonify({
+        "total_visitors": len(visitors_log),
+        "unique_visitors": len(set(v["name"] for v in visitors_log)),
+        "known_persons": len(set(data["names"])) if data["names"] else 0
+    })
+
+def generate_frames():
+    fps = 0
+    frame_count = 0
+    prev_t = time.time()
+
+    while True:
+        with lock:
+            if output_frame is None:
+                continue
+            f = output_frame.copy()
+
+        frame_count += 1
+        now = time.time()
+        if now - prev_t >= 1.0:
+            fps = frame_count / (now - prev_t)
+            prev_t = now
+            frame_count = 0
+
+        cv2.putText(f, f"FPS: {fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+
+        ret, buffer = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ret:
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+def start_camera_threads():
+    global t1, t2
+    t1 = threading.Thread(target=capture_thread)
+    t2 = threading.Thread(target=detection_thread)
+    t1.daemon = True
+    t2.daemon = True
+    t1.start()
+    t2.start()
+
+if __name__ == '__main__':
+    start_camera_threads()
+    time.sleep(2)
+
+    print("🚀 Starting Face Recognition Web Server with MQTT...")
+    try:
+        app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
+    finally:
+        stop_thread = True
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        if 't1' in globals():
+            t1.join()
+        if 't2' in globals():
+            t2.join()
