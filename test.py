@@ -1,7 +1,7 @@
 import face_recognition
 
 # Load gambar
-image = face_recognition.load_image_file("test.jpg")
+image = face_recognition.load_image_file("foto.jpg")
 
 # Cari lokasi wajah
 face_locations = face_recognition.face_locations(image)
