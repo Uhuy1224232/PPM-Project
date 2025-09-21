@@ -2,7 +2,7 @@ import face_recognition
 import cv2
 
 # Load gambar
-image = face_recognition.load_image_file("test.jpg")
+image = face_recognition.load_image_file("foto.jpg")
 face_locations = face_recognition.face_locations(image)
 
 print(f"Jumlah wajah terdeteksi: {len(face_locations)}")
