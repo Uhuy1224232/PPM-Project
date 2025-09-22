@@ -1,26 +1,27 @@
+import cv2
 import subprocess
 import numpy as np
 
-rtsp_url = "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream"
+url = "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream"
 
-command = [
+cmd = [
     "ffmpeg",
     "-rtsp_transport", "tcp",
-    "-i", rtsp_url,
-    "-frames:v", "1",          # ambil 1 frame saja
-    "-f", "image2pipe",
+    "-i", url,
+    "-f", "rawvideo",
     "-pix_fmt", "bgr24",
-    "-vcodec", "rawvideo", "-"
+    "-vsync", "0",
+    "-"
 ]
 
-try:
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    raw_frame = proc.stdout.read(1920 * 1080 * 3)  # coba resolusi FullHD
-    if raw_frame:
-        frame = np.frombuffer(raw_frame, np.uint8)
-        print("✅ RTSP stream OK, panjang data:", len(frame))
-    else:
-        print("❌ Tidak ada frame yang diterima")
-    proc.terminate()
-except Exception as e:
-    print("⚠️ Error:", e)
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+w, h = 1920, 1080  # sesuai output kameramu
+frame_size = w * h * 3
+
+while True:
+    raw = proc.stdout.read(frame_size)
+    if len(raw) != frame_size:
+        break
+    frame = np.frombuffer(raw, np.uint8).reshape((h, w, 3))
+    print("✅ Frame diterima:", frame.shape)
