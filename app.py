@@ -7,6 +7,7 @@ import time
 import mediapipe as mp
 from flask import Flask, render_template, Response, jsonify
 from datetime import datetime
+import subprocess
 
 app = Flask(__name__)
 
@@ -14,9 +15,9 @@ app = Flask(__name__)
 try:
     with open("encodings.pickle", "rb") as f:
         data = pickle.load(f)
-    print(f"Data wajah berhasil dimuat: {set(data['names'])}")
+    print(f"✅ Data wajah berhasil dimuat: {set(data['names'])}")
 except FileNotFoundError:
-    print("File encodings.pickle tidak ditemukan!")
+    print("⚠️ File encodings.pickle tidak ditemukan!")
     data = {"encodings": [], "names": []}
 
 TOLERANCE = 0.40
@@ -40,33 +41,54 @@ mp_face = mp.solutions.face_detection.FaceDetection(
     min_detection_confidence=0.4
 )
 
+# ================= FFmpeg RTSP Capture =================
+class FFmpegCamera:
+    def __init__(self, url, w=1920, h=1080):
+        self.url = url
+        self.w = w
+        self.h = h
+        self.frame_size = w * h * 3
+        self.proc = None
+
+    def start(self):
+        cmd = [
+            "ffmpeg",
+            "-rtsp_transport", "tcp",
+            "-i", self.url,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-vsync", "0",
+            "-"
+        ]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def read(self):
+        raw = self.proc.stdout.read(self.frame_size)
+        if len(raw) != self.frame_size:
+            return None
+        frame = np.frombuffer(raw, np.uint8).reshape((self.h, self.w, 3))
+        return frame
+
+    def release(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+
 # ================= Thread untuk capture dari kamera (RTSP) =================
 def capture_thread():
     global frame, stop_thread
-    rtsp_url = "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream"
+    camera = FFmpegCamera("rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream")
+    camera.start()
 
     while not stop_thread:
-        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-
-        if not cap.isOpened():
-            print("Tidak bisa konek ke RTSP, coba lagi 3 detik...")
-            time.sleep(3)
-            continue
-
-        while not stop_thread:
-            ret, f = cap.read()
-            if not ret:
-                print("Gagal ambil frame, reconnect...")
-                break
+        f = camera.read()
+        if f is not None:
             with lock:
                 frame = f
-            time.sleep(0.01)
-
-        cap.release()
-        time.sleep(1)  # jeda sebelum reconnect
+        else:
+            print("⚠️ Gagal ambil frame dari kamera")
+            time.sleep(0.1)
+    camera.release()
 
 # ================= Thread untuk face detection + recognition =================
 def detection_thread():
@@ -83,11 +105,9 @@ def detection_thread():
         if frame_count % PROCESS_EVERY_N_FRAMES != 0:
             continue
 
-        # resize biar lebih ringan
         small_frame = cv2.resize(f, None, fx=DOWNSCALE, fy=DOWNSCALE)
         rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-        # pakai MediaPipe untuk deteksi wajah
         results = mp_face.process(rgb_small)
 
         if results.detections:
@@ -99,10 +119,8 @@ def detection_thread():
                 x2 = x1 + int(bboxC.width * w)
                 y2 = y1 + int(bboxC.height * h)
 
-                # skala balik ke ukuran asli
                 x1, y1, x2, y2 = [int(val / DOWNSCALE) for val in (x1, y1, x2, y2)]
 
-                # crop wajah untuk face_recognition
                 face_crop = f[y1:y2, x1:x2]
                 name = "Tamu"
 
@@ -112,8 +130,6 @@ def detection_thread():
 
                     if encs:
                         enc = encs[0]
-
-                        # Bandingkan dengan database
                         matches = face_recognition.compare_faces(data["encodings"], enc, tolerance=TOLERANCE)
                         face_distances = face_recognition.face_distance(data["encodings"], enc)
 
@@ -122,12 +138,10 @@ def detection_thread():
                             if matches[best_match_index]:
                                 name = data["names"][best_match_index]
 
-                # gambar kotak & nama
                 cv2.rectangle(f, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(f, name, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                # cek apakah melewati garis
                 if y2 >= LINE_Y:
                     now = time.time()
                     if now - last_trigger_time > TRIGGER_DELAY:
@@ -138,10 +152,7 @@ def detection_thread():
                         })
                         last_trigger_time = now
 
-        # gambar garis line detector
         cv2.line(f, (0, LINE_Y), (f.shape[1], LINE_Y), (0, 0, 255), 2)
-        
-        # tambahkan informasi status
         cv2.putText(f, "Face Recognition System", (10, f.shape[0] - 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(f, f"Visitors: {len(visitors_log)}", (10, f.shape[0] - 15),
@@ -162,7 +173,7 @@ def video_feed():
 
 @app.route('/api/visitors')
 def get_visitors():
-    return jsonify(visitors_log[-10:])  # Return 10 pengunjung terakhir
+    return jsonify(visitors_log[-10:])
 
 @app.route('/api/stats')
 def get_stats():
@@ -183,7 +194,6 @@ def generate_frames():
                 continue
             f = output_frame.copy()
 
-        # hitung FPS
         frame_count += 1
         now = time.time()
         if now - prev_t >= 1.0:
@@ -194,7 +204,6 @@ def generate_frames():
         cv2.putText(f, f"FPS: {fps:.1f}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
 
-        # encode frame ke JPEG
         ret, buffer = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ret:
             frame_bytes = buffer.tobytes()
@@ -217,7 +226,7 @@ if __name__ == '__main__':
     print("🚀 Starting Face Recognition Web Server...")
     print("📱 Local access: http://localhost:5000")
     print("🌐 Network access: http://YOUR_IP_ADDRESS:5000")
-
+    
     try:
         app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
     finally:
