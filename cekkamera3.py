@@ -1,15 +1,18 @@
 import cv2
 
 url = "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream"
-cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)  # pakai backend ffmpeg
+
+# Pakai backend FFmpeg
+cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
 
 if not cap.isOpened():
-    print("❌ Tidak bisa membuka stream")
+    print("❌ Gagal buka stream")
 else:
-    for i in range(50):  # baca 50 frame pertama
+    for i in range(20):
         ret, frame = cap.read()
         if not ret:
-            print("⚠️ Gagal membaca frame ke-", i)
+            print(f"⚠️ Frame {i} gagal terbaca")
             break
-        print(f"✅ Frame {i} terbaca: {frame.shape}")
+        print(f"✅ Frame {i} OK, shape: {frame.shape}")
+
 cap.release()
