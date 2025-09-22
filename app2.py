@@ -46,7 +46,7 @@ mp_face = mp.solutions.face_detection.FaceDetection(
 def capture_thread():
     global frame, stop_thread
     cap = cv2.VideoCapture(
-        "rtsp://admin:BABKQU@192.168.196.93:554/h264/ch1/main/av_stream",
+        "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream",
         cv2.CAP_FFMPEG
     )
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
