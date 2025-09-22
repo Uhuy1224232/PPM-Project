@@ -7,7 +7,6 @@ import time
 import mediapipe as mp
 from flask import Flask, render_template, Response, jsonify
 from datetime import datetime
-import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
 
@@ -15,9 +14,9 @@ app = Flask(__name__)
 try:
     with open("encodings.pickle", "rb") as f:
         data = pickle.load(f)
-    print(f"✅ Data wajah berhasil dimuat: {set(data['names'])}")
+    print(f"Data wajah berhasil dimuat: {set(data['names'])}")
 except FileNotFoundError:
-    print("⚠️ File encodings.pickle tidak ditemukan!")
+    print("File encodings.pickle tidak ditemukan!")
     data = {"encodings": [], "names": []}
 
 TOLERANCE = 0.40
@@ -29,53 +28,51 @@ output_frame = None
 lock = threading.Lock()
 stop_thread = False
 
+# ================= Line detector =================
 LINE_Y = 200
 last_trigger_time = 0
 TRIGGER_DELAY = 3
-visitors_log = []
+visitors_log = []  # Log pengunjung
 
+# ================= Init MediaPipe =================
 mp_face = mp.solutions.face_detection.FaceDetection(
     model_selection=0,
     min_detection_confidence=0.4
 )
 
-# ================= MQTT =================
-MQTT_BROKER = "192.168.1.100"  # IP server MQTT (bisa sama server Ubuntu)
-MQTT_PORT = 1883
-MQTT_TOPIC = "led/display"
-mqtt_client = mqtt.Client()
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
-
-# ================= Camera capture =================
+# ================= Thread untuk capture dari kamera (RTSP) =================
 def capture_thread():
     global frame, stop_thread
+    rtsp_url = "rtsp://admin:BABKQU@192.168.196.110:554/h264/ch1/main/av_stream"
+
     while not stop_thread:
-        cap = cv2.VideoCapture(
-            "rtsp://admin:BABKQU@192.168.196.93:554/h264/ch1/main/av_stream",
-            cv2.CAP_FFMPEG
-        )
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
         if not cap.isOpened():
-            print("⚠️ Tidak bisa konek ke RTSP, coba lagi...")
+            print("Tidak bisa konek ke RTSP, coba lagi 3 detik...")
             time.sleep(3)
             continue
 
         while not stop_thread:
             ret, f = cap.read()
-            if ret:
-                with lock:
-                    frame = f
-            else:
-                print("⚠️ Gagal ambil frame, reconnect...")
+            if not ret:
+                print("Gagal ambil frame, reconnect...")
                 break
+            with lock:
+                frame = f
             time.sleep(0.01)
-        cap.release()
 
-# ================= Face detection + MQTT trigger =================
+        cap.release()
+        time.sleep(1)  # jeda sebelum reconnect
+
+# ================= Thread untuk face detection + recognition =================
 def detection_thread():
     global frame, output_frame, stop_thread, last_trigger_time, visitors_log
     frame_count = 0
-
+    
     while not stop_thread:
         with lock:
             if frame is None:
@@ -86,9 +83,11 @@ def detection_thread():
         if frame_count % PROCESS_EVERY_N_FRAMES != 0:
             continue
 
+        # resize biar lebih ringan
         small_frame = cv2.resize(f, None, fx=DOWNSCALE, fy=DOWNSCALE)
         rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
+        # pakai MediaPipe untuk deteksi wajah
         results = mp_face.process(rgb_small)
 
         if results.detections:
@@ -99,27 +98,36 @@ def detection_thread():
                 y1 = int(bboxC.ymin * h)
                 x2 = x1 + int(bboxC.width * w)
                 y2 = y1 + int(bboxC.height * h)
+
+                # skala balik ke ukuran asli
                 x1, y1, x2, y2 = [int(val / DOWNSCALE) for val in (x1, y1, x2, y2)]
 
+                # crop wajah untuk face_recognition
                 face_crop = f[y1:y2, x1:x2]
                 name = "Tamu"
 
                 if face_crop.size > 0:
                     rgb_face = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
                     encs = face_recognition.face_encodings(rgb_face)
+
                     if encs:
                         enc = encs[0]
+
+                        # Bandingkan dengan database
                         matches = face_recognition.compare_faces(data["encodings"], enc, tolerance=TOLERANCE)
                         face_distances = face_recognition.face_distance(data["encodings"], enc)
+
                         if len(face_distances) > 0:
                             best_match_index = np.argmin(face_distances)
                             if matches[best_match_index]:
                                 name = data["names"][best_match_index]
 
+                # gambar kotak & nama
                 cv2.rectangle(f, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(f, name, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+                # cek apakah melewati garis
                 if y2 >= LINE_Y:
                     now = time.time()
                     if now - last_trigger_time > TRIGGER_DELAY:
@@ -128,10 +136,12 @@ def detection_thread():
                             "name": name,
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         })
-                        mqtt_client.publish(MQTT_TOPIC, f"Selamat Datang {name}")
                         last_trigger_time = now
 
+        # gambar garis line detector
         cv2.line(f, (0, LINE_Y), (f.shape[1], LINE_Y), (0, 0, 255), 2)
+        
+        # tambahkan informasi status
         cv2.putText(f, "Face Recognition System", (10, f.shape[0] - 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(f, f"Visitors: {len(visitors_log)}", (10, f.shape[0] - 15),
@@ -152,7 +162,7 @@ def video_feed():
 
 @app.route('/api/visitors')
 def get_visitors():
-    return jsonify(visitors_log[-10:])
+    return jsonify(visitors_log[-10:])  # Return 10 pengunjung terakhir
 
 @app.route('/api/stats')
 def get_stats():
@@ -166,13 +176,14 @@ def generate_frames():
     fps = 0
     frame_count = 0
     prev_t = time.time()
-
+    
     while True:
         with lock:
             if output_frame is None:
                 continue
             f = output_frame.copy()
 
+        # hitung FPS
         frame_count += 1
         now = time.time()
         if now - prev_t >= 1.0:
@@ -183,12 +194,14 @@ def generate_frames():
         cv2.putText(f, f"FPS: {fps:.1f}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
 
+        # encode frame ke JPEG
         ret, buffer = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ret:
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
+# ================= Start Threads =================
 def start_camera_threads():
     global t1, t2
     t1 = threading.Thread(target=capture_thread)
@@ -201,15 +214,13 @@ def start_camera_threads():
 if __name__ == '__main__':
     start_camera_threads()
     time.sleep(2)
+    print("🚀 Starting Face Recognition Web Server...")
+    print("📱 Local access: http://localhost:5000")
+    print("🌐 Network access: http://YOUR_IP_ADDRESS:5000")
 
-    print("🚀 Starting Face Recognition Web Server with MQTT...")
     try:
         app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
     finally:
         stop_thread = True
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
-        if 't1' in globals():
-            t1.join()
-        if 't2' in globals():
-            t2.join()
+        if 't1' in globals(): t1.join()
+        if 't2' in globals(): t2.join()
